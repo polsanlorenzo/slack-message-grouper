@@ -42,29 +42,29 @@ async def handle_mentions(text: str, channel: str, ts: str, sender_id: str):
 
     for word in words:
         if word.startswith("<@") and word.endswith(">"):
+            # --- Direct user mention ---
             mention = word.strip("<@>")
-            print(f"[DEBUG] Found mention: {mention}")
+            print(f"[DEBUG] Found user mention: {mention}")
 
-            # --- Case 1: Direct user mention ---
             if mention.startswith("U"):
                 if mention in ALLOWED_USERS:
                     await notify_user(mention, text, word, channel, ts, sender_id)
                 else:
                     print(f"[DEBUG] User {mention} not in ALLOWED_USERS")
 
-            # --- Case 2: User group mention ---
-            elif mention.startswith("subteam^S"):
-                group_id = mention.split("^")[1]
-                print(f"[DEBUG] User group mention: {group_id}")
+        elif word.startswith("<!subteam^") and word.endswith(">"):
+            # --- User group mention ---
+            group_id = word.split("^")[1].strip(">")
+            print(f"[DEBUG] Found user group mention: {group_id}")
 
-                members = get_usergroup_members(group_id)
-                print(f"[DEBUG] Group members: {members}")
+            members = get_usergroup_members(group_id)
+            print(f"[DEBUG] Group members: {members}")
 
-                for user_id in members:
-                    if user_id in ALLOWED_USERS:
-                        await notify_user(user_id, text, word, channel, ts, sender_id)
-                    else:
-                        print(f"[DEBUG] Skipping {user_id}, not in ALLOWED_USERS")
+            for user_id in members:
+                if user_id in ALLOWED_USERS:
+                    await notify_user(user_id, text, word, channel, ts, sender_id)
+                else:
+                    print(f"[DEBUG] Skipping {user_id}, not in ALLOWED_USERS")
 
 
 async def notify_user(user_id: str, full_text: str, mention: str, channel: str, ts: str, sender_id: str):
