@@ -29,7 +29,15 @@ async def slack_events(request: Request):
         ts = event.get("ts")
         sender_id = event.get("user")
 
-        print(f"[INFO] Handling message: {text} from {sender_id}")
+        # Case 1: DM command "remove task N"
+        if event.get("channel_type") == "im":
+            match = re.match(r"remove task (\d+)", text.strip(), re.I)
+            if match:
+                task_num = int(match.group(1))
+                await remove_task(sender_id, task_num)
+                return {"ok": True}
+
+        # Case 2: Mentions in channels / groups
         await handle_mentions(text, channel, ts, sender_id)
 
     return {"ok": True}
@@ -38,13 +46,10 @@ async def slack_events(request: Request):
 async def handle_mentions(text: str, channel: str, ts: str, sender_id: str):
     words = text.split()
     for word in words:
-        # Direct user mention
         if word.startswith("<@") and word.endswith(">"):
             mention = word.strip("<@>")
             if mention.startswith("U") and mention in ALLOWED_USERS:
                 await add_task(mention, text, word, channel, ts, sender_id)
-
-        # User group mention
         elif word.startswith("<!subteam^") and word.endswith(">"):
             group_id = word.split("^")[1].strip(">")
             members = get_usergroup_members(group_id)
@@ -54,7 +59,6 @@ async def handle_mentions(text: str, channel: str, ts: str, sender_id: str):
 
 
 async def add_task(user_id: str, full_text: str, mention: str, channel: str, ts: str, sender_id: str):
-    """Find old task list, append new task, send updated list, delete old list."""
     task_text = full_text.replace(mention, "").strip()
     truncated = task_text[:100] + "..." if len(task_text) > 100 else task_text
     link = await get_permalink(channel, ts)
@@ -63,36 +67,53 @@ async def add_task(user_id: str, full_text: str, mention: str, channel: str, ts:
 
     im_channel, old_ts, tasks = get_latest_tasklist(user_id)
     tasks.append(new_task)
+    await post_tasklist(im_channel, tasks, old_ts, user_id)
 
-    # Format new message
-    body = "Remaining tasks:\n" + "\n".join(
-        [f"{i+1}. {task}" for i, task in enumerate(tasks)]
-    )
+
+async def remove_task(user_id: str, task_num: int):
+    """Remove a task by its number and update the list."""
+    im_channel, old_ts, tasks = get_latest_tasklist(user_id)
+
+    if not tasks:
+        client.chat_postMessage(channel=im_channel, text="No task list found.")
+        return
+
+    if task_num < 1 or task_num > len(tasks):
+        client.chat_postMessage(channel=im_channel, text=f"Task {task_num} does not exist.")
+        return
+
+    removed = tasks.pop(task_num - 1)
+    await post_tasklist(im_channel, tasks, old_ts, user_id, removed_task=removed)
+
+
+async def post_tasklist(im_channel: str, tasks: list, old_ts: str, user_id: str, removed_task: str = None):
+    if tasks:
+        body = "Remaining tasks:\n" + "\n".join(
+            [f"{i+1}. {task}" for i, task in enumerate(tasks)]
+        )
+    else:
+        body = "🎉 All tasks completed!"
+
+    if removed_task:
+        body = f"✅ Removed: {removed_task}\n\n" + body
 
     try:
-        # Post updated list
         resp = client.chat_postMessage(channel=im_channel, text=body)
-        print(f"[INFO] Posted new task list to {user_id}")
-
-        # Delete old list if exists
         if old_ts:
             client.chat_delete(channel=im_channel, ts=old_ts)
-            print(f"[INFO] Deleted old task list for {user_id}")
-
     except SlackApiError as e:
         print(f"[ERROR] Posting task list: {e.response['error']}")
 
 
 def get_latest_tasklist(user_id: str):
-    """Return (channel_id, old_message_ts, tasks[]) if a task list exists in DM, else []"""
     try:
         resp = client.conversations_open(users=user_id)
         im_channel = resp["channel"]["id"]
 
         history = client.conversations_history(channel=im_channel, limit=20)
         for msg in history["messages"]:
-            if msg.get("text", "").startswith("Remaining tasks:"):
-                lines = msg["text"].splitlines()[1:]
+            if msg.get("text", "").startswith("Remaining tasks:") or msg.get("text", "").startswith("✅ Removed:"):
+                lines = [line for line in msg["text"].splitlines() if re.match(r"^\d+\.", line)]
                 tasks = [re.sub(r"^\d+\.\s*", "", line) for line in lines]
                 return im_channel, msg["ts"], tasks
 
