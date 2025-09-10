@@ -1,4 +1,5 @@
 import os
+import re
 import json
 from fastapi import FastAPI, Request
 from slack_sdk import WebClient
@@ -6,7 +7,7 @@ from slack_sdk.errors import SlackApiError
 import uvicorn
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-ALLOWED_USERS = {"U03AA1ZBH5F"}  # Replace with real IDs
+ALLOWED_USERS = {"U03AA1ZBH5F"}  # Replace with your real IDs
 
 app = FastAPI()
 client = WebClient(token=SLACK_BOT_TOKEN)
@@ -15,12 +16,10 @@ client = WebClient(token=SLACK_BOT_TOKEN)
 @app.post("/slack/events")
 async def slack_events(request: Request):
     data = await request.json()
-
-    # Log entire request for debugging
     print("=== Incoming Slack event ===")
     print(json.dumps(data, indent=2))
 
-    if "challenge" in data:  # URL verification
+    if "challenge" in data:
         return {"challenge": data["challenge"]}
 
     event = data.get("event", {})
@@ -38,52 +37,74 @@ async def slack_events(request: Request):
 
 async def handle_mentions(text: str, channel: str, ts: str, sender_id: str):
     words = text.split()
-    print(f"[DEBUG] Words detected: {words}")
-
     for word in words:
+        # Direct user mention
         if word.startswith("<@") and word.endswith(">"):
-            # --- Direct user mention ---
             mention = word.strip("<@>")
-            print(f"[DEBUG] Found user mention: {mention}")
+            if mention.startswith("U") and mention in ALLOWED_USERS:
+                await add_task(mention, text, word, channel, ts, sender_id)
 
-            if mention.startswith("U"):
-                if mention in ALLOWED_USERS:
-                    await notify_user(mention, text, word, channel, ts, sender_id)
-                else:
-                    print(f"[DEBUG] User {mention} not in ALLOWED_USERS")
-
+        # User group mention
         elif word.startswith("<!subteam^") and word.endswith(">"):
-            # --- User group mention ---
             group_id = word.split("^")[1].strip(">")
-            print(f"[DEBUG] Found user group mention: {group_id}")
-
             members = get_usergroup_members(group_id)
-            print(f"[DEBUG] Group members: {members}")
-
             for user_id in members:
                 if user_id in ALLOWED_USERS:
-                    await notify_user(user_id, text, word, channel, ts, sender_id)
-                else:
-                    print(f"[DEBUG] Skipping {user_id}, not in ALLOWED_USERS")
+                    await add_task(user_id, text, word, channel, ts, sender_id)
 
 
-async def notify_user(user_id: str, full_text: str, mention: str, channel: str, ts: str, sender_id: str):
-    """Send DM with who pinged + truncated text + link."""
+async def add_task(user_id: str, full_text: str, mention: str, channel: str, ts: str, sender_id: str):
+    """Find old task list, append new task, send updated list, delete old list."""
     task_text = full_text.replace(mention, "").strip()
     truncated = task_text[:100] + "..." if len(task_text) > 100 else task_text
     link = await get_permalink(channel, ts)
-
     sender_name = get_username(sender_id)
+    new_task = f"{truncated} (from {sender_name}) - {link}"
 
-    message = f"New task from {sender_name}:\n{truncated}\n{link}"
-    print(f"[INFO] Notifying {user_id} with: {message}")
-    await send_dm(user_id, message)
+    im_channel, old_ts, tasks = get_latest_tasklist(user_id)
+    tasks.append(new_task)
+
+    # Format new message
+    body = "Remaining tasks:\n" + "\n".join(
+        [f"{i+1}. {task}" for i, task in enumerate(tasks)]
+    )
+
+    try:
+        # Post updated list
+        resp = client.chat_postMessage(channel=im_channel, text=body)
+        print(f"[INFO] Posted new task list to {user_id}")
+
+        # Delete old list if exists
+        if old_ts:
+            client.chat_delete(channel=im_channel, ts=old_ts)
+            print(f"[INFO] Deleted old task list for {user_id}")
+
+    except SlackApiError as e:
+        print(f"[ERROR] Posting task list: {e.response['error']}")
+
+
+def get_latest_tasklist(user_id: str):
+    """Return (channel_id, old_message_ts, tasks[]) if a task list exists in DM, else []"""
+    try:
+        resp = client.conversations_open(users=user_id)
+        im_channel = resp["channel"]["id"]
+
+        history = client.conversations_history(channel=im_channel, limit=20)
+        for msg in history["messages"]:
+            if msg.get("text", "").startswith("Remaining tasks:"):
+                lines = msg["text"].splitlines()[1:]
+                tasks = [re.sub(r"^\d+\.\s*", "", line) for line in lines]
+                return im_channel, msg["ts"], tasks
+
+        return im_channel, None, []
+    except SlackApiError as e:
+        print(f"[ERROR] Fetching task list: {e.response['error']}")
+        return None, None, []
 
 
 def get_usergroup_members(group_id: str):
     try:
         resp = client.usergroups_users_list(usergroup=group_id)
-        print(f"[DEBUG] usergroups.users.list response: {resp}")
         return resp.get("users", [])
     except SlackApiError as e:
         print(f"[ERROR] Fetching group members: {e.response['error']}")
@@ -91,7 +112,6 @@ def get_usergroup_members(group_id: str):
 
 
 def get_username(user_id: str) -> str:
-    """Resolve user ID into Slack display name."""
     try:
         resp = client.users_info(user=user_id)
         return resp["user"]["profile"].get("display_name") or resp["user"]["real_name"]
@@ -103,23 +123,10 @@ def get_username(user_id: str) -> str:
 async def get_permalink(channel: str, ts: str):
     try:
         resp = client.chat_getPermalink(channel=channel, message_ts=ts)
-        print(f"[DEBUG] Permalink: {resp['permalink']}")
         return resp["permalink"]
     except SlackApiError as e:
         print(f"[ERROR] Getting permalink: {e.response['error']}")
         return "#"
-
-
-async def send_dm(user_id: str, message: str):
-    try:
-        resp = client.conversations_open(users=user_id)
-        im_channel = resp["channel"]["id"]
-        print(f"[DEBUG] Opened IM channel {im_channel} for {user_id}")
-
-        client.chat_postMessage(channel=im_channel, text=message)
-        print(f"[INFO] DM sent to {user_id}")
-    except SlackApiError as e:
-        print(f"[ERROR] Sending DM: {e.response['error']}")
 
 
 if __name__ == "__main__":
